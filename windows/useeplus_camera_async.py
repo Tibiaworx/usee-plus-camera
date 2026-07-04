@@ -9,6 +9,7 @@ Deps: libusb1 (import usb1), libusb-package, numpy, opencv-python.
 WinUSB must be bound to Interface 1 (Zadig).
 """
 import os
+import io
 import threading
 import queue
 import libusb_package
@@ -18,6 +19,7 @@ os.add_dll_directory(os.path.dirname(libusb_package.get_library_path()))
 import usb1  # noqa: E402
 import numpy as np  # noqa: E402
 import cv2  # noqa: E402
+from PIL import Image  # noqa: E402  (used to validate JPEG completeness)
 
 VID, PID = 0x2CE3, 0x3828
 INTF, ALT = 1, 1
@@ -59,6 +61,7 @@ class UseePlusCameraAsync:
         self.zoom = self.zoomup = self.zoomdown = False
         self.has_gsensor = False   # true if any packet reports hasg
         self.angle = None          # g-sensor tilt (this unit has none -> stays None)
+        self.corrupt_skipped = 0   # truncated frames dropped before display
         self._prev_btn = False
 
     # -- lifecycle -------------------------------------------------------
@@ -141,9 +144,11 @@ class UseePlusCameraAsync:
             n = transfer.getActualLength()
             if n > PKT_HEADER:
                 data = transfer.getBuffer()[:n]
-                if data[0] == 0xAA and data[1] == 0xBB:
-                    if data[2] in (7, 10):          # image packet: byte[7] = flags
-                        self._flags(data[7])
+                # ONLY image packets (CID 7/10) carry JPEG data. Control replies
+                # (CID 5 devinfo, 6 open-stream, 0x0B switch) must NOT be spliced
+                # into the frame buffer - doing so truncates/corrupts the JPEG.
+                if data[0] == 0xAA and data[1] == 0xBB and data[2] in (7, 10):
+                    self._flags(data[7])
                     self._buf += data[PKT_HEADER:]
                     self._carve()
             elif st == usb1.TRANSFER_TIMED_OUT:
@@ -207,13 +212,21 @@ class UseePlusCameraAsync:
                          res_value & 0xFF, 0x00])
         self._write(bytes(cmd))
 
-    def frames(self):
-        """Yield decoded BGR frames."""
+    def frames(self, skip_corrupt=True):
+        """Yield decoded BGR frames. Truncated frames (dropped USB packets during a
+        device stall) are skipped so the viewer holds the last good frame instead of
+        flashing a partial image."""
         while self._running or not self._q.empty():
             try:
                 jpg = self._q.get(timeout=1.0)
             except queue.Empty:
                 continue
+            if skip_corrupt:
+                try:
+                    Image.open(io.BytesIO(jpg)).load()   # raises on truncation
+                except Exception:
+                    self.corrupt_skipped += 1
+                    continue
             img = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
             if img is not None:
                 yield img
