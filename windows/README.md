@@ -55,20 +55,28 @@ with UseePlusCameraAsync() as cam:
 - Each 944-byte IN packet = 12-byte header + JPEG data; strip 12, carve `FF D8..FF D9`.
 - See `PROTOCOL.md` for the full command set (start/stop, camera+resolution switch).
 
-## Metadata (button / tilt) - NOT available over the video interface
-The hardware shutter button and g-sensor tilt angle are NOT in the video stream.
-Verified: the per-frame packet header holds only a counter + a 4-cycle tag, and the
-gap between consecutive JPEGs is 0 bytes. The app reads button/angle via a separate
-native `getdevflag`/`getdevinfo` status call inside `libOtgCamera.so`, which is not
-yet reverse-engineered. `usee_app.py` has inert hooks (`cam.button`, `cam.angle`)
-ready to light up if that RE is done later (would need an ARM64 disassembly of
-`libOtgCamera.so` or a longer USB-probing session).
+## Sidecar flags (hardware button / zoom / g-sensor)
+Each CID-7 image packet carries a flags byte at **offset 7**. Bit layout (confirmed by
+decompiling `libOtgCamera.so` `handle_pro` + `UCallBackHandle1`):
+
+| bit | mask | meaning |
+|----|------|---------|
+| 0 | 0x01 | `hasg` - g-sensor data present |
+| 1 | 0x02 | **`picbutton` - hardware shutter button** |
+| 2 | 0x04 | `zoom` |
+| 3 | 0x08 | `zoomup` |
+| 4 | 0x10 | `zoomdown` |
+
+The driver decodes these on every packet: `cam.button`, `cam.button_presses` (edge
+counter the app uses to fire a snapshot), `cam.zoom/zoomup/zoomdown`, `cam.has_gsensor`.
+**On this unit only the shutter button is wired** - `hasg` and the zoom bits stay 0, so
+tilt auto-rotate is inactive (no accelerometer). Pressing the physical button in the app
+saves a `captures\btn_*.png` and flashes a "SHUTTER" overlay.
 
 ## Done
 - Live 640x480 preview, async ~8 fps (device-limited), auto-reconnect.
-- Snapshot + .avi record, standalone .exe.
+- Snapshot + .avi record, **hardware shutter button**, standalone .exe.
 
 ## Ideas / TODO
-- Reverse-engineer `getdevflag`/`getdevinfo` in `libOtgCamera.so` to enable the
-  hardware button + tilt auto-rotate.
 - Nicer GUI (Qt/Tkinter) with a settings panel and a capture gallery.
+- Read `getdevinfo` (CID 5) live for firmware/vendor strings + capability bitmap.

@@ -51,13 +51,15 @@ class UseePlusCameraAsync:
         self._thread = None
         self._write_lock = threading.Lock()
         self._empty_timeouts = 0
-        # NOTE: the hardware button and g-sensor angle are NOT carried in the video
-        # stream (verified: frame headers hold only a counter/tag, and inter-frame
-        # gap is 0 bytes). They are only available via the native getdevflag/
-        # getdevinfo status call, which is not yet reverse-engineered. Kept here as
-        # inert hooks so the app can light up if/when that RE lands.
-        self.button = False        # hardware shutter button pressed?  (always False for now)
-        self.angle = None          # g-sensor tilt in degrees, or None  (always None for now)
+        # Per-frame sidecar flags live in byte[7] of each CID-7 image packet
+        # (confirmed via Ghidra decompile of libOtgCamera.so handle_pro/UCallBackHandle1):
+        #   bit0=hasg  bit1=picbutton  bit2=zoom  bit3=zoomup  bit4=zoomdown
+        self.button = False        # hardware shutter button, current state
+        self.button_presses = 0    # monotonic count of button-press edges (app consumes this)
+        self.zoom = self.zoomup = self.zoomdown = False
+        self.has_gsensor = False   # true if any packet reports hasg
+        self.angle = None          # g-sensor tilt (this unit has none -> stays None)
+        self._prev_btn = False
 
     # -- lifecycle -------------------------------------------------------
     def open(self):
@@ -140,6 +142,8 @@ class UseePlusCameraAsync:
             if n > PKT_HEADER:
                 data = transfer.getBuffer()[:n]
                 if data[0] == 0xAA and data[1] == 0xBB:
+                    if data[2] in (7, 10):          # image packet: byte[7] = flags
+                        self._flags(data[7])
                     self._buf += data[PKT_HEADER:]
                     self._carve()
             elif st == usb1.TRANSFER_TIMED_OUT:
@@ -183,6 +187,18 @@ class UseePlusCameraAsync:
                     self._q.put_nowait(jpg)
                 except queue.Empty:
                     pass
+
+    def _flags(self, b7):
+        """Decode the byte[7] flags of an image packet (runs on the USB thread)."""
+        self.has_gsensor = self.has_gsensor or bool(b7 & 0x01)
+        btn = bool(b7 & 0x02)
+        if btn and not self._prev_btn:      # rising edge = one press
+            self.button_presses += 1
+        self._prev_btn = btn
+        self.button = btn
+        self.zoom = bool(b7 & 0x04)
+        self.zoomup = bool(b7 & 0x08)
+        self.zoomdown = bool(b7 & 0x10)
 
     # -- public ----------------------------------------------------------
     def set_resolution(self, res_value, cam=1):

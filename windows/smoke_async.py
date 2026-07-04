@@ -9,4 +9,5 @@ with UseePlusCameraAsync() as cam:
             break
     dt = time.time() - t
     print(f"{n} frames in {dt:.1f}s = {n/dt:.1f} fps | "
-          f"counter={cam.frame_counter} dropped_packets={cam.dropped}")
+          f"button_presses={cam.button_presses} has_gsensor={cam.has_gsensor} "
+          f"zoom={cam.zoom}/{cam.zoomup}/{cam.zoomdown}")

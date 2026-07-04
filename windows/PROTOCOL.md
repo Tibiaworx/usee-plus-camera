@@ -11,18 +11,38 @@ Apple MFi) is ignored for Windows.
   - **BULK OUT = 0x01**, **BULK IN = 0x81**, wMaxPacketSize 512 (high-speed).
 - Access on Windows: WinUSB bound via Zadig -> pyusb/libusb userspace. No kernel driver.
 
-## CONFIRMED ON HARDWARE (working Windows capture)
-- Stream = 640x480 JPEG frames, ~2-3 fps. Decoded real images via WinUSB/pyusb.
-- Each IN packet is **944 bytes** and does NOT coalesce (device short-packets every 944).
-- **Per-packet layout: 8-byte transport header + 4-byte rotating tag + JPEG data.**
-  - Header: `AA BB 07 [len16=0x03AB] 00 00 00` (device->host magic is `AA BB`, type 0x07).
-  - 4-byte tag cycles through 4 values: `F9 BB C6 94` (frame-start, followed by `FF D8`),
-    then `01 80 14 F6`, `60 33 30 24`, `22 FF 24 E8`, repeating.
-  - **Strip 12 bytes from every packet, concatenate, carve FF D8..FF D9 = one JPEG.**
-    (Verified: FF D8 sits at exactly offset 12; strip=13 destroys the marker.)
-- Pull cadence that works: send `BB AA 05` ONCE, then read IN continuously; if a read
-  times out, poke with `BB AA 06` (or `05`) to resume. Device streams packets back-to-back.
-- Send `BB AA 08` to stop.
+## IN packet layout (device->host) — confirmed by libOtgCamera.so `handle_pro`
+Stream = 640x480 JPEG frames, ~8 fps. Each IN packet is 944 bytes and does NOT coalesce
+(device short-packets every 944). Fields (offsets are into the raw packet):
+
+```
+ off 0..1  : AA BB           magic
+ off 2     : CID             5=devinfo, 6=open-stream, 7/10=image, 0x0B=switch-cam
+ off 3..4  : length (LE)     "pro->length" = 0x03AB (939) for image packets
+ off 5     : per-frame id    changes when a new frame starts (vs continuation)
+ off 7     : FLAGS byte      bit0 hasg, bit1 picbutton, bit2 zoom, bit3 zoomup, bit4 zoomdown
+ off 8..11 : marker/aux u32
+ off 12..  : JPEG data       length = pro->length - 7 = 932 bytes/packet
+```
+
+**Reassembly: strip 12 bytes from every packet, concatenate, carve FF D8 .. FF D9 = one
+JPEG.** (Verified two ways: FF D8 sits at exactly offset 12 on frame-start packets, and
+`handle_pro` calls `mu_camera_data_add(pkt+0xC, pro_len-7)`.)
+
+### Sidecar flags — byte[7] (see `handle_pro` + `UCallBackHandle1`)
+| bit | mask | OtgCameraPic field | notes |
+|----|------|--------------------|-------|
+| 0  | 0x01 | hasg               | g-sensor present (0 on this unit) |
+| 1  | 0x02 | picbutton          | **hardware shutter button** (momentary, ~1 packet/press) |
+| 2  | 0x04 | zoom               | 0 on this unit |
+| 3  | 0x08 | zoomup             | 0 on this unit |
+| 4  | 0x10 | zoomdown           | 0 on this unit |
+
+The g-sensor angle is a `float` at `mfi_pic_info+0x0c` (`Setangle`), gated by `hasg`.
+
+### Pull cadence
+Send `BB AA 05` ONCE, then read IN continuously; on a read timeout, poke with
+`BB AA 06` (or `05`) to resume. Device streams packets back-to-back. Send `BB AA 08` to stop.
 
 ## Vendor command framing (OUT, host->device)
 Little-endian header: `[0]=0xBB [1]=0xAA [2]=CID [3..4]=length(LE) [5..]=payload`

@@ -55,10 +55,10 @@ def run_once():
     writer = None
     recording = False
     show_hud = True
-    prev_button = False
 
     with Camera() as cam:
         print("connected - streaming")
+        prev_presses = cam.button_presses
         cv2.namedWindow(APP, cv2.WINDOW_NORMAL)
         for frame in cam.frames():
             fps_n += 1
@@ -66,12 +66,14 @@ def run_once():
                 fps = fps_n / (time.time() - fps_t)
                 fps_t, fps_n = time.time(), 0
 
-            # hardware shutter button -> snapshot on press edge
-            if cam.button and not prev_button:
+            # hardware shutter button -> snapshot on each new press
+            btn_flash = False
+            if cam.button_presses != prev_presses:
+                prev_presses = cam.button_presses
                 fn = os.path.join(SHOTS, f"btn_{stamp()}.png")
                 cv2.imwrite(fn, frame)
                 print("hardware-button snapshot:", fn)
-            prev_button = cam.button
+                btn_flash = True
 
             # tilt auto-rotate (only if angle known)
             disp = frame
@@ -87,7 +89,13 @@ def run_once():
             if recording and writer is not None:
                 writer.write(frame)
 
-            cv2.imshow(APP, draw_hud(disp, fps, recording, cam.angle, show_hud))
+            hud = draw_hud(disp, fps, recording, cam.angle, show_hud)
+            if btn_flash:
+                h, w = hud.shape[:2]
+                cv2.rectangle(hud, (0, 0), (w - 1, h - 1), (255, 255, 255), 14)
+                cv2.putText(hud, "SHUTTER", (w // 2 - 90, h // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255, 255, 255), 3, cv2.LINE_AA)
+            cv2.imshow(APP, hud)
 
             k = cv2.waitKey(1) & 0xFF
             if k in (ord('q'), 27):
