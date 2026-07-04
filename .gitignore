@@ -1,0 +1,23 @@
+# --- Decompiled vendor APK (proprietary, huge) - reference only, not committed ---
+sight unpacl/
+*.apk
+
+# --- Build artifacts / release binaries (exe goes to Releases, not the repo) ---
+windows/build/
+windows/dist/
+windows/*.spec
+__pycache__/
+*.pyc
+
+# --- Capture / experiment artifacts ---
+windows/captures/
+windows/reads.pkl
+*.pkl
+*.bin
+*.avi
+# captured frames from the RE probes
+windows/frame_*.jpg
+windows/snap_*.png
+windows/good_strip*.jpg
+windows/rec_*.avi
+dump_raw.bin

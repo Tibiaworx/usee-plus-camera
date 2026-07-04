@@ -1,0 +1,6 @@
+pyusb
+libusb1
+libusb-package
+numpy
+opencv-python
+pillow
