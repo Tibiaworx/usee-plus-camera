@@ -46,7 +46,8 @@ Full setup and usage: **[windows/README.md](windows/README.md)**.
 
 | Path | Contents |
 |------|----------|
-| `windows/usee_app.py` | Main app: live preview, snapshot, record, auto-reconnect |
+| `windows/usee_gui.py` | **Qt (PySide6) GUI**: live preview, thumbnail gallery, toolbar, dark theme |
+| `windows/usee_app.py` | Lightweight OpenCV-window app: preview, snapshot, record, auto-reconnect |
 | `windows/useeplus_camera_async.py` | High-throughput async USB driver (`UseePlusCameraAsync`) |
 | `windows/useeplus_camera.py` | Simple synchronous driver |
 | `windows/viewer.py` | Minimal viewer |

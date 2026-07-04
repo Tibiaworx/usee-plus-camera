@@ -4,3 +4,4 @@ libusb-package
 numpy
 opencv-python
 pillow
+PySide6-Essentials   # for usee_gui.py (the Qt GUI)

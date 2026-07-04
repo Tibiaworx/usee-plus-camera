@@ -19,16 +19,21 @@ Userspace Windows driver + live viewer for the i4season inspection camera
 
 ## Run
 
-**Standalone (no Python needed):** double-click `dist\UseePlusCamera.exe`
-(build it with `build_exe.ps1`, or `pip install -r requirements.txt pyinstaller` then run that script).
+**Standalone (no Python needed):** double-click one of the built exes in `dist\`:
+- `UseePlusCameraGUI.exe` - the full **Qt GUI** (recommended): live preview, thumbnail
+  gallery, toolbar (snapshot / record / flip / rotate / fullscreen), dark theme.
+- `UseePlusCamera.exe` - the lightweight OpenCV-window app.
+
+Build them with `build_exe.ps1` (`pip install -r requirements.txt pyinstaller` first).
 
 **From source:**
 ```
-python usee_app.py      # main app: auto-reconnect, snapshot, record
-python viewer.py        # simpler viewer
+python usee_gui.py      # Qt GUI (needs PySide6)
+python usee_app.py      # OpenCV-window app: HUD, snapshot (s), record (r), hud (h)
+python viewer.py        # minimal viewer
 ```
-Keys: `q` quit, `s` snapshot, `r` record .avi, `h` toggle HUD.
-Snapshots/recordings go to the `captures\` subfolder.
+Snapshots/recordings go to the `captures\` subfolder. In the GUI, `S` = snapshot,
+`R` = record, `F11` = fullscreen, and the camera's hardware button auto-snaps.
 
 Only ONE program can hold the camera at a time — close one before starting another.
 
