@@ -73,3 +73,9 @@ Full setup and usage: **[windows/README.md](windows/README.md)**.
 Independent, interoperability-focused reverse engineering of a device the owner
 possesses, for the purpose of making it work on a platform the vendor doesn't support.
 No vendor code is redistributed here. Trademarks belong to their respective owners.
+
+## License
+
+This project is licensed under the **GNU General Public License v3.0** — see the [LICENSE](LICENSE) file for full terms.
+
+Copyright (C) 2026 Tibiaworx. You may use, modify, and distribute this software (including commercially), but any distributed derivative work must also be released as open source under the GPL.
