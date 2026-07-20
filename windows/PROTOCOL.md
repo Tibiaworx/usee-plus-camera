@@ -40,9 +40,33 @@ JPEG.** (Verified two ways: FF D8 sits at exactly offset 12 on frame-start packe
 
 The g-sensor angle is a `float` at `mfi_pic_info+0x0c` (`Setangle`), gated by `hasg`.
 
-### Pull cadence
-Send `BB AA 05` ONCE, then read IN continuously; on a read timeout, poke with
-`BB AA 06` (or `05`) to resume. Device streams packets back-to-back. Send `BB AA 08` to stop.
+### Pull cadence — SETTLED BY WIRE CAPTURE
+Send `BB AA 05` **once**, then read IN continuously. Send `BB AA 08` to stop.
+
+**Do NOT send `BB AA 06` while streaming — it kills the stream.** The device
+auto-streams after `05`; a hardware USB sniffer shows the Android reference app
+sending **zero** host->device packets for an entire 21 s steady-state session
+(36,315 IN tokens on ep 0x01, nothing else on any endpoint).
+
+Measured, with pull/no-pull order reversed to rule out ordering effects:
+
+| condition | frames in 12 s |
+|-----------|----------------|
+| `BB AA 06` every 0.5 s | 2 |
+| no pulls               | 86 |
+| `BB AA 06` every 0.5 s | 1 |
+| no pulls               | 85 |
+
+The old "poke on timeout to resume" advice was actively harmful: a stall caused
+read timeouts, the timeouts sent `BB AA 06`, the pull killed the stream, which
+caused more timeouts. Recovery belongs in a watchdog that reopens the device,
+not in a mid-stream poke.
+
+### byte[5] is a frame counter — SETTLED BY WIRE CAPTURE
+`byte[5]` increments by exactly 1 per frame and is constant across all packets
+of the same frame (238/250 transitions +1 on a clean reference capture; ~9
+packets per run). Use it for authoritative frame boundaries and for detecting
+dropped frames, rather than inferring structure from `FF D8`/`FF D9` alone.
 
 ## Vendor command framing (OUT, host->device)
 Little-endian header: `[0]=0xBB [1]=0xAA [2]=CID [3..4]=length(LE) [5..]=payload`
@@ -54,16 +78,31 @@ Little-endian header: `[0]=0xBB [1]=0xAA [2]=CID [3..4]=length(LE) [5..]=payload
 | 0x08 | stop / disconnect stream       | `BB AA 08 00 00`                  |
 | 0x0B | switch camera / get info       | `BB AA 0B 00 02 01 <cam> <res> 00`|
 
-MFi wake probe: OUT `FF 55 FF 55 EE 10`, expected IN `BB AA 05 00 00 10`.
+MFi wake probe: OUT `FF 55 FF 55 EE 10` on **endpoint 0x02** (the iAP interface,
+MI_00 — NOT the video endpoint). Actual reply observed on the wire is
+`FF 55 02 00 EE 10`, **not** the `BB AA 05 00 00 10` previously documented.
 
-## Init & preview sequence
-1. Open device, claim interface 1, `set_interface_altsetting(alt=1)`. Endpoints: OUT 0x01 / IN 0x81.
-2. MFi probe (`testmfiusb`): read 6 bytes IN, write `FF 55 FF 55 EE 10` OUT (wake/probe).
-3. `begincmd()` (native session open).
-4. Open-stream loop (<=10 tries): write `BB AA 05 00 00`; read up to 0x4400; if reply `buf[2]==0x05`,
-   then write `BB AA 06 00 00`; read; success when reply `buf[2]==0x06`.
-5. Native `CallBackStart` thread then continuously pulls frames (repeated 05/06 pulls) and
-   reassembles vendor "pro" packets by `pro->length` into complete frames.
+## Init & preview sequence — OBSERVED ON THE WIRE
+Captured cold (unplug -> replug -> app launch) with a hardware USB sniffer.
+The reference app's complete init is six bulk OUT packets; that is all of it:
+
+```
+IN    ep 0x02   ff 55 02 00 ee 10          MFi reply
+OUT   ep 0x02   ff 55 ff 55 ee 10          MFi probe (iAP interface!)
+SETUP ep0       SET_INTERFACE(intf=1, alt=1)
+SETUP ep0       GET_DESCRIPTOR(String #5) -> "com.useeplus.protocol"
+OUT   ep 0x01   bb aa 05 00 00             open stream
+IN    ep 0x01   ...video flows ~155 ms later
+```
+
+Corrections to the APK-derived sequence above:
+- There is **no `05` -> `06` handshake**. The app sends `05` and nothing more.
+- `begincmd()` emits **no wire traffic** - it is purely native bookkeeping.
+- There are **no `checkid`/`getlic` identity or license commands** on the wire.
+  Nothing gates streaming on model or licence.
+- The MFi probe belongs on **ep 0x02**, not the video endpoint. (Sending it on
+  ep 0x01 was tested and is harmless to throughput, but it is not what the
+  reference does and it injects foreign bytes into the video pipe.)
 
 ## Switch camera / resolution (`changeCamera(cam,res)`)
 On-wire command (from `OtgCameraApi.changeCamera` smali): write 8 bytes
@@ -77,13 +116,60 @@ NEVER acknowledges CID 0x0B, and the frame size stays 640x480. `changeCamera` is
 dead code in the app (never called by the UI for OTG). Conclusion: this "supercamera"
 unit is fixed 640x480 over USB; the multi-resolution code serves other i4season products.
 
-## Frame rate (measured)
-- Device is self-paced: ~90 ms median between frames (~11 fps ceiling), dragged to
-  ~8 fps average by occasional ~600 ms stalls. Likely exposure-limited (dim scene).
-- Throughput is only ~0.06 MB/s (0.15% of USB high-speed) -> NOT bandwidth-limited.
-- 16 vs 64 in-flight async transfers give identical fps -> NOT host/transfer-limited.
-- Sync one-read-at-a-time driver = ~4 fps; async (>=16 in-flight) = ~8 fps (2x), which
-  is the practical device ceiling in current lighting. See `useeplus_camera_async.py`.
+## Frame rate — RE-MEASURED ON THE WIRE
+
+The device is a **metronome at 90 ms/frame**. It is NOT exposure-limited; the
+earlier "~600 ms stalls, likely dim scene" conclusion was wrong.
+
+**Android reference app** (hardware sniffer, clean capture, zero PHY/CRC/overflow):
+
+| metric | value |
+|--------|-------|
+| frame rate | **12.67 fps** |
+| inter-frame p50 / p90 / max | **90 / 90 / 90 ms** |
+| gaps >150 ms | **0** (over 271 frames / 21.4 s) |
+
+`max == p50`. Not one stall. Throughput ~0.06 MB/s = 0.15% of USB high-speed,
+so nothing here is bandwidth-limited.
+
+### The Windows throttle (OPEN ISSUE)
+Under WinUSB/libusb the same device, cable and sniffer yields **~7.3 fps** with a
+rigid periodic dropout. Characterised precisely:
+
+- **10 frames delivered, ~6 dropped, repeating every 17 frames = 1.53 s**
+- stall duration **630 ms**, period **1.53 s ±0.05** - invariant across every
+  driver parameter tried (see below)
+- `byte[5]` **keeps advancing through the stall** (e.g. 8 -> 15, 25 -> 32): the
+  device is still generating frames, it just stops transmitting them
+- the last packet before a stall is usually **truncated** (479-586 B instead of
+  939) - the device aborts a frame mid-transmission, then goes quiet
+- during the stall the device simply **NAKs**; no STALL handshake, no USB error,
+  no retry. Host IN-token rate drops 1725/s -> 81/s (xHCI NAK backoff, an
+  effect of the silence rather than its cause)
+- 11.1 fps native x 10/17 = 6.5 fps, consistent with the ~7.3 fps observed
+
+Ruled out by direct experiment (each tested against the 1.53 s / 630 ms signature):
+
+| hypothesis | result |
+|------------|--------|
+| JPEG carve pair-loss | fixed; stalls persist |
+| `CMD_PULL` poking | removed; stalls persist |
+| MFi probe on ep 0x01 vs 0x02 | A/B tested - no effect |
+| host not servicing iAP interface | reference app doesn't either - ruled out |
+| in-flight transfers (16/8/4/2) | no effect |
+| read size (944 / 0x4000 / 0x4400 / 0x8800) | no effect |
+| transfer timeout (500 / 2000 / 5000 ms) | no effect |
+| host CPU load, JPEG decode | no effect |
+
+Wire behaviour of the two hosts is near-identical (Windows 1726 IN/s vs Android
+1697 IN/s, same endpoint, same commands), yet only Windows provokes the abort.
+**Root cause unknown.** The remaining untested dimension is fine-grained host
+transfer *retirement timing*, which is below this sniffer's resolution and would
+need submission-level instrumentation rather than more capture.
+
+Note: keep the transfer timeout comfortably above 630 ms. `timeout_ms=500` is
+shorter than the stall, so every stall times out the transfers and throughput
+drops to ~5 fps.
 
 ## Frames
 - **Each frame is a self-contained JPEG** (confirmed: `BitmapFactory.decodeByteArray`,
@@ -99,8 +185,29 @@ unit is fixed 640x480 over USB; the multi-resolution code serves other i4season 
 - cmd write 1000ms, bulk data read 5000ms, connect/disconnect 100ms.
 - read chunk 0x4000 (16384); frame read buffer 0x4400 (17408).
 
-## Still-unknown (needs live capture or Ghidra on libOtgCamera.so `datatransfer`/`handle_pro`)
-1. Exact multi-packet frame reassembly (is byte[3..4] payload len or total; continuation scheme).
-2. GET_ALLINFO exact request bytes.
-3. Steady-state pull cadence (one `BB AA 06` per frame vs auto-stream).
-4. Meaning of the CBW identity commands (checkid/getlic) — model/license gating.
+## Resolved by hardware USB capture
+1. ~~Exact multi-packet frame reassembly~~ — `byte[3..4]` is the **payload** length
+   (0x03AB = 939; JPEG bytes = length - 7 = 932). A frame is ~9 packets of 944 B
+   (512 + 432 on the wire). Continuation is signalled by `byte[5]` holding the
+   same value; a new frame starts when it increments.
+3. ~~Steady-state pull cadence~~ — **auto-stream**. One `BB AA 05`, then read.
+   Sending `BB AA 06` mid-stream kills it.
+4. ~~CBW identity commands (checkid/getlic)~~ — **not present on the wire at all.**
+   No model or licence gating is involved in streaming.
+
+## Still unknown
+2. GET_ALLINFO exact request bytes (CID 5 devinfo never observed in a capture —
+   the reference app doesn't request it during normal preview).
+5. **Root cause of the 1.53 s / 630 ms Windows throttle** (see Frame rate above).
+   Everything the driver controls has been eliminated; the device aborts frames
+   mid-transmission only under WinUSB/libusb, never under Android.
+6. Undocumented `byte[7]` flag bits: values `0x80` and `0x40` observed on a small
+   number of packets. The documented map only covers bits 0-4.
+
+## Method note
+Findings above marked "wire" came from an inline hardware USB sniffer
+(Alex Taradov's LS/FS/HS design) tapping the host<->camera link, with the
+Android app used as a known-good control. Captures were rejected unless the
+sniffer's info channel reported zero `Hardware buffer overflow` events — an
+overflow silently deletes packets and produces convincing but false framing
+errors. Two early conclusions had to be retracted for exactly that reason.
