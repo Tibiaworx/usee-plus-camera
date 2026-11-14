@@ -10,8 +10,8 @@ Supports the Interface 1 JPEG and Interface 0 raw YUYV layouts via WinUSB.
 """
 import os
 import io
-import threading
 import time
+import threading
 import queue
 import libusb_package
 
@@ -39,6 +39,10 @@ PKT_HEADER = 12
 READ_SIZE  = 0x4400
 SOI, EOI   = b"\xff\xd8", b"\xff\xd9"
 MAX_BUF    = 4 << 20   # 4 MB guard
+# Device is self-paced at ~90 ms/frame (11 fps) - measured on the wire with a
+# USB sniffer against the reference implementation. Anything past ~3 s of dead
+# air means the link died, not that the scene is dark.
+STALL_TIMEOUT = 3.0
 
 # resolution bitmask value -> (w, h)
 RES = {0x01: (320, 240), 0x02: (480, 480), 0x04: (640, 480), 0x08: (1280, 720),
@@ -70,6 +74,11 @@ class UseePlusCameraAsync:
         self.angle = None          # g-sensor tilt (this unit has none -> stays None)
         self.corrupt_skipped = 0   # truncated frames dropped before display
         self._prev_btn = False
+        self.stalls = 0            # times the watchdog had to reopen the device
+        self.torn_frames = 0       # frames discarded by the SOI-before-EOI guard
+        self._usb_errors = 0       # transient USBErrors survived by the event loop
+        self._last_frame_ts = 0.0
+        self._wd_thread = None
 
     # -- lifecycle -------------------------------------------------------
     def open(self):
@@ -117,6 +126,7 @@ class UseePlusCameraAsync:
         self._write(CMD_OPEN)
 
         self._running = True
+        self._last_frame_ts = time.time()
         for _ in range(self.num_transfers):
             t = self.handle.getTransfer()
             t.setBulk(EP_IN, READ_SIZE, callback=self._on_transfer,
@@ -125,10 +135,12 @@ class UseePlusCameraAsync:
             self._transfers.append(t)
         self._thread = threading.Thread(target=self._event_loop, daemon=True)
         self._thread.start()
+        self._wd_thread = threading.Thread(target=self._watchdog, daemon=True)
+        self._wd_thread.start()
 
     def close(self):
         self._running = False
-        if self._interface is not None and not self._raw_yuyv:
+        if self._interface is not None and self.handle is not None and not self._raw_yuyv:
             try:
                 self._write(CMD_STOP)
             except Exception:
@@ -141,15 +153,17 @@ class UseePlusCameraAsync:
                 pass
         if self._thread:
             self._thread.join(timeout=1.0)
+        if self._wd_thread:
+            self._wd_thread.join(timeout=1.5)
         if self.handle is not None:
             if self._interface is not None:
                 try:
                     self.handle.releaseInterface(self._interface)
                 except usb1.USBError:
                     pass
-                self._interface = None
             self.handle.close()
             self.handle = None
+        self._interface = None
         try:
             self.ctx.close()
         except Exception:
@@ -167,11 +181,73 @@ class UseePlusCameraAsync:
             return self.handle.bulkWrite(EP_OUT, data, timeout=800)
 
     def _event_loop(self):
+        # NOTE: a transient USBError (bus reset, timeout race, device NAK storm)
+        # must NOT kill this loop. Breaking here orphans every in-flight transfer
+        # and the stream dies permanently with no signal to the caller - the app
+        # keeps painting its last frame and looks alive. Confirmed with a USB
+        # sniffer: after the break the host stops emitting IN tokens entirely
+        # (zero packets on the wire) until the process is restarted.
         while self._running:
             try:
                 self.ctx.handleEventsTimeout(0.1)
             except usb1.USBError:
+                self._usb_errors += 1
+                continue
+
+    def _watchdog(self):
+        """Reopen the device if no frame has arrived for STALL_TIMEOUT seconds."""
+        while self._running:
+            time.sleep(1.0)
+            if not self._running:
                 break
+            idle = time.time() - self._last_frame_ts
+            if idle < STALL_TIMEOUT:
+                continue
+            self.stalls += 1
+            try:
+                self._reopen()
+            except Exception:
+                pass
+            self._last_frame_ts = time.time()   # don't thrash if reopen failed
+
+    def _reopen(self):
+        """Tear the USB session down and bring it back up, in place."""
+        for t in self._transfers:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        self._transfers = []
+        if self.handle is not None:
+            try:
+                self.handle.releaseInterface(INTF)
+            except Exception:
+                pass
+            try:
+                self.handle.close()
+            except Exception:
+                pass
+            self.handle = None
+        time.sleep(0.2)
+        self.handle = self.ctx.openByVendorIDAndProductID(
+            VID, PID, skip_on_error=False)
+        if self.handle is None:
+            raise RuntimeError("device vanished during reopen")
+        self.handle.claimInterface(INTF)
+        self.handle.setInterfaceAltSetting(INTF, ALT)
+        self._buf.clear()               # stale half-frame must not survive
+        self._write(CMD_MFI)
+        try:
+            self.handle.bulkRead(EP_IN, 64, timeout=300)
+        except usb1.USBError:
+            pass
+        self._write(CMD_OPEN)
+        for _ in range(self.num_transfers):
+            t = self.handle.getTransfer()
+            t.setBulk(EP_IN, READ_SIZE, callback=self._on_transfer,
+                      timeout=self.timeout_ms)
+            t.submit()
+            self._transfers.append(t)
 
     def _on_transfer(self, transfer):
         st = transfer.getStatus()
@@ -189,13 +265,20 @@ class UseePlusCameraAsync:
                     self._buf += data[PKT_HEADER:]
                     self._carve()
             elif st == usb1.TRANSFER_TIMED_OUT:
-                # genuinely idle -> gently nudge the device to resume streaming
+                # Just count it. Do NOT poke the device with CMD_PULL.
+                #
+                # The device auto-streams after CMD_OPEN - verified on the wire:
+                # the reference implementation sends ZERO host->device packets
+                # for the entire steady-state session. Worse, sending BB AA 06
+                # while streaming actively KILLS the stream. Measured, with the
+                # pull-vs-no-pull order reversed to rule out ordering effects:
+                #     06 every 0.5s -> 2 frames  |  no pulls -> 86 frames
+                #     06 every 0.5s -> 1 frame   |  no pulls -> 85 frames
+                # The old "nudge on timeout" was therefore a death spiral: a
+                # stall caused timeouts -> timeouts sent CMD_PULL -> the pull
+                # killed the stream -> more timeouts -> more pulls. Recovery is
+                # the watchdog's job (reopen), not a mid-stream poke.
                 self._empty_timeouts += 1
-                if self._empty_timeouts % 3 == 0:
-                    try:
-                        self._write(CMD_PULL)
-                    except Exception:
-                        pass
         # resubmit unless shutting down / cancelled
         if self._running and st != usb1.TRANSFER_CANCELLED:
             try:
@@ -213,13 +296,24 @@ class UseePlusCameraAsync:
                 break
             if s > 0:
                 del buf[:s]
-            e = buf.find(EOI)
+            e = buf.find(EOI, 2)
+            # A second SOI before the EOI means frame N lost packets mid-flight
+            # and never terminated. Without this guard find(EOI) returns frame
+            # N+1's terminator, both frames get spliced into one blob, and the
+            # decode fails - so ONE dropped packet costs TWO frames. Drop only
+            # the truncated frame and resync on the next SOI.
+            s2 = buf.find(SOI, 2)
+            if s2 >= 0 and (e < 0 or s2 < e):
+                del buf[:s2]
+                self.torn_frames += 1
+                continue
             if e < 0:
                 if len(buf) > MAX_BUF:
                     del buf[:]
                 break
             jpg = bytes(buf[:e + 2])
             del buf[:e + 2]
+            self._last_frame_ts = time.time()   # feed the stall watchdog
             # push newest, drop oldest if full (keep latency low)
             try:
                 self._q.put_nowait(jpg)
