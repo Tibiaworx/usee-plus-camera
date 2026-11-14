@@ -6,7 +6,7 @@ stays saturated instead of one-blocking-read-at-a-time. Also supports switching
 camera / resolution on the fly.
 
 Deps: libusb1 (import usb1), libusb-package, numpy, opencv-python.
-WinUSB must be bound to Interface 1 (Zadig).
+Supports the Interface 1 JPEG and Interface 0 raw YUYV layouts via WinUSB.
 """
 import os
 import io
@@ -25,6 +25,10 @@ from PIL import Image  # noqa: E402  (used to validate JPEG completeness)
 VID, PID = 0x2CE3, 0x3828
 INTF, ALT = 1, 1
 EP_OUT, EP_IN = 0x01, 0x81
+
+RAW_WIDTH, RAW_HEIGHT = 640, 480
+RAW_FRAME_BYTES = RAW_WIDTH * RAW_HEIGHT * 2
+RAW_EP_OUT, RAW_EP_IN = 0x02, 0x82
 
 CMD_MFI  = bytes([0xFF, 0x55, 0xFF, 0x55, 0xEE, 0x10])
 CMD_OPEN = bytes([0xBB, 0xAA, 0x05, 0x00, 0x00])
@@ -51,6 +55,8 @@ class UseePlusCameraAsync:
         self.timeout_ms = timeout_ms
         self.ctx = usb1.USBContext()
         self.handle = None
+        self._interface = None
+        self._raw_yuyv = False
         self._buf = bytearray()
         self._q = queue.Queue(maxsize=4)   # raw JPEG bytes; small = low latency
         self._transfers = []
@@ -76,13 +82,42 @@ class UseePlusCameraAsync:
 
     # -- lifecycle -------------------------------------------------------
     def open(self):
-        self.ctx.open()
-        self.handle = self.ctx.openByVendorIDAndProductID(
-            VID, PID, skip_on_error=False)
-        if self.handle is None:
-            raise RuntimeError(f"{VID:04X}:{PID:04X} not found / WinUSB not bound")
-        self.handle.claimInterface(INTF)
-        self.handle.setInterfaceAltSetting(INTF, ALT)
+        try:
+            self.ctx.open()
+            self.handle = self.ctx.openByVendorIDAndProductID(
+                VID, PID, skip_on_error=False)
+            if self.handle is None:
+                raise RuntimeError(f"{VID:04X}:{PID:04X} not found / WinUSB not bound")
+
+            self._raw_yuyv = any(
+                setting.getNumber() == 0
+                and setting.getAlternateSetting() == 0
+                and {RAW_EP_OUT, RAW_EP_IN}.issubset(
+                    ep.getAddress() for ep in setting.iterEndpoints()
+                    if (ep.getAttributes() & 0x03) == 2
+                )
+                for setting in self.handle.getDevice().iterSettings()
+            )
+            interface = 0 if self._raw_yuyv else INTF
+            self.handle.claimInterface(interface)
+            self._interface = interface
+            if self._raw_yuyv:
+                self.handle.controlRead(0xA0, 0, 5, 0, 512, timeout=2000)
+                sent = self.handle.controlWrite(
+                    0x20, 1, 5, 0, b"0" * 64, timeout=2000
+                )
+                if sent != 64:
+                    raise RuntimeError("Incomplete YUYV start request")
+                self._running = True
+            else:
+                self.handle.setInterfaceAltSetting(INTF, ALT)
+                self._start_jpeg()
+        except Exception:
+            self.close()
+            raise
+        return self
+
+    def _start_jpeg(self):
         self._write(CMD_MFI)
         try:
             self.handle.bulkRead(EP_IN, 64, timeout=300)
@@ -102,11 +137,10 @@ class UseePlusCameraAsync:
         self._thread.start()
         self._wd_thread = threading.Thread(target=self._watchdog, daemon=True)
         self._wd_thread.start()
-        return self
 
     def close(self):
         self._running = False
-        if self.handle is not None:
+        if self._interface is not None and self.handle is not None and not self._raw_yuyv:
             try:
                 self._write(CMD_STOP)
             except Exception:
@@ -122,12 +156,14 @@ class UseePlusCameraAsync:
         if self._wd_thread:
             self._wd_thread.join(timeout=1.5)
         if self.handle is not None:
-            try:
-                self.handle.releaseInterface(INTF)
-            except Exception:
-                pass
+            if self._interface is not None:
+                try:
+                    self.handle.releaseInterface(self._interface)
+                except usb1.USBError:
+                    pass
             self.handle.close()
             self.handle = None
+        self._interface = None
         try:
             self.ctx.close()
         except Exception:
@@ -303,6 +339,8 @@ class UseePlusCameraAsync:
     # -- public ----------------------------------------------------------
     def set_resolution(self, res_value, cam=1):
         """res_value: a key of RES (e.g. 0x08 for 1280x720). cam: camera index."""
+        if self._raw_yuyv:
+            raise NotImplementedError("YUYV mode uses a fixed 640×480 stream")
         cmd = bytearray([0xBB, 0xAA, 0x0B, 0x00, 0x02, cam & 0xFF,
                          res_value & 0xFF, 0x00])
         self._write(bytes(cmd))
@@ -311,6 +349,10 @@ class UseePlusCameraAsync:
         """Yield decoded BGR frames. Truncated frames (dropped USB packets during a
         device stall) are skipped so the viewer holds the last good frame instead of
         flashing a partial image."""
+        if self._raw_yuyv:
+            yield from self._raw_frames()
+            return
+
         while self._running or not self._q.empty():
             try:
                 jpg = self._q.get(timeout=1.0)
@@ -325,3 +367,17 @@ class UseePlusCameraAsync:
             img = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
             if img is not None:
                 yield img
+
+    def _raw_frames(self):
+        deadline = time.monotonic() + self.timeout_ms / 1000
+        while self._running:
+            data = self.handle.bulkRead(
+                RAW_EP_IN, RAW_FRAME_BYTES, timeout=self.timeout_ms
+            )
+            if len(data) == RAW_FRAME_BYTES:
+                pixels = np.frombuffer(data, dtype=np.uint8)
+                pixels = pixels.reshape(RAW_HEIGHT, RAW_WIDTH, 2)
+                yield cv2.cvtColor(pixels, cv2.COLOR_YUV2BGR_YUY2)
+                deadline = time.monotonic() + self.timeout_ms / 1000
+            elif time.monotonic() >= deadline:
+                raise RuntimeError("No complete YUYV frame received")

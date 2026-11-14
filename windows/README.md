@@ -4,6 +4,17 @@ Userspace Windows driver + live viewer for the i4season inspection camera
 (USB VID `2CE3` / PID `3828`). No kernel driver — talks to the camera's
 `com.useeplus.protocol` interface via WinUSB + libusb.
 
+## Interface 0 YUYV cameras
+
+Some `2CE3:3828` cameras expose a single interface with bulk endpoints
+`0x82` IN and `0x02` OUT. The desktop viewers detect that layout and
+display the fixed 640×480 raw YUYV stream. If Zadig already shows WinUSB
+on the working `useepluscam` entry, use that binding. Close any browser
+viewer before opening the desktop viewer.
+
+The Interface 1 instructions below apply to the JPEG camera layout.
+Hardware shutter and camera/resolution switching use the JPEG protocol.
+
 ## One-time setup
 
 1. **Bind WinUSB to Interface 1** with [Zadig](https://zadig.akeo.ie/):
