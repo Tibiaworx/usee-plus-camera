@@ -6,12 +6,12 @@ stays saturated instead of one-blocking-read-at-a-time. Also supports switching
 camera / resolution on the fly.
 
 Deps: libusb1 (import usb1), libusb-package, numpy, opencv-python.
-WinUSB must be bound to Interface 1 (Zadig).
+Supports the Interface 1 JPEG and Interface 0 raw YUYV layouts via WinUSB.
 """
 import os
 import io
-import time
 import threading
+import time
 import queue
 import libusb_package
 
@@ -26,6 +26,10 @@ VID, PID = 0x2CE3, 0x3828
 INTF, ALT = 1, 1
 EP_OUT, EP_IN = 0x01, 0x81
 
+RAW_WIDTH, RAW_HEIGHT = 640, 480
+RAW_FRAME_BYTES = RAW_WIDTH * RAW_HEIGHT * 2
+RAW_EP_OUT, RAW_EP_IN = 0x02, 0x82
+
 CMD_MFI  = bytes([0xFF, 0x55, 0xFF, 0x55, 0xEE, 0x10])
 CMD_OPEN = bytes([0xBB, 0xAA, 0x05, 0x00, 0x00])
 CMD_PULL = bytes([0xBB, 0xAA, 0x06, 0x00, 0x00])
@@ -35,10 +39,6 @@ PKT_HEADER = 12
 READ_SIZE  = 0x4400
 SOI, EOI   = b"\xff\xd8", b"\xff\xd9"
 MAX_BUF    = 4 << 20   # 4 MB guard
-# Device is self-paced at ~90 ms/frame (11 fps) - measured on the wire with a
-# USB sniffer against the reference implementation. Anything past ~3 s of dead
-# air means the link died, not that the scene is dark.
-STALL_TIMEOUT = 3.0
 
 # resolution bitmask value -> (w, h)
 RES = {0x01: (320, 240), 0x02: (480, 480), 0x04: (640, 480), 0x08: (1280, 720),
@@ -51,6 +51,8 @@ class UseePlusCameraAsync:
         self.timeout_ms = timeout_ms
         self.ctx = usb1.USBContext()
         self.handle = None
+        self._interface = None
+        self._raw_yuyv = False
         self._buf = bytearray()
         self._q = queue.Queue(maxsize=4)   # raw JPEG bytes; small = low latency
         self._transfers = []
@@ -68,21 +70,45 @@ class UseePlusCameraAsync:
         self.angle = None          # g-sensor tilt (this unit has none -> stays None)
         self.corrupt_skipped = 0   # truncated frames dropped before display
         self._prev_btn = False
-        self.stalls = 0            # times the watchdog had to reopen the device
-        self.torn_frames = 0       # frames discarded by the SOI-before-EOI guard
-        self._usb_errors = 0       # transient USBErrors survived by the event loop
-        self._last_frame_ts = 0.0
-        self._wd_thread = None
 
     # -- lifecycle -------------------------------------------------------
     def open(self):
-        self.ctx.open()
-        self.handle = self.ctx.openByVendorIDAndProductID(
-            VID, PID, skip_on_error=False)
-        if self.handle is None:
-            raise RuntimeError(f"{VID:04X}:{PID:04X} not found / WinUSB not bound")
-        self.handle.claimInterface(INTF)
-        self.handle.setInterfaceAltSetting(INTF, ALT)
+        try:
+            self.ctx.open()
+            self.handle = self.ctx.openByVendorIDAndProductID(
+                VID, PID, skip_on_error=False)
+            if self.handle is None:
+                raise RuntimeError(f"{VID:04X}:{PID:04X} not found / WinUSB not bound")
+
+            self._raw_yuyv = any(
+                setting.getNumber() == 0
+                and setting.getAlternateSetting() == 0
+                and {RAW_EP_OUT, RAW_EP_IN}.issubset(
+                    ep.getAddress() for ep in setting.iterEndpoints()
+                    if (ep.getAttributes() & 0x03) == 2
+                )
+                for setting in self.handle.getDevice().iterSettings()
+            )
+            interface = 0 if self._raw_yuyv else INTF
+            self.handle.claimInterface(interface)
+            self._interface = interface
+            if self._raw_yuyv:
+                self.handle.controlRead(0xA0, 0, 5, 0, 512, timeout=2000)
+                sent = self.handle.controlWrite(
+                    0x20, 1, 5, 0, b"0" * 64, timeout=2000
+                )
+                if sent != 64:
+                    raise RuntimeError("Incomplete YUYV start request")
+                self._running = True
+            else:
+                self.handle.setInterfaceAltSetting(INTF, ALT)
+                self._start_jpeg()
+        except Exception:
+            self.close()
+            raise
+        return self
+
+    def _start_jpeg(self):
         self._write(CMD_MFI)
         try:
             self.handle.bulkRead(EP_IN, 64, timeout=300)
@@ -91,7 +117,6 @@ class UseePlusCameraAsync:
         self._write(CMD_OPEN)
 
         self._running = True
-        self._last_frame_ts = time.time()
         for _ in range(self.num_transfers):
             t = self.handle.getTransfer()
             t.setBulk(EP_IN, READ_SIZE, callback=self._on_transfer,
@@ -100,13 +125,10 @@ class UseePlusCameraAsync:
             self._transfers.append(t)
         self._thread = threading.Thread(target=self._event_loop, daemon=True)
         self._thread.start()
-        self._wd_thread = threading.Thread(target=self._watchdog, daemon=True)
-        self._wd_thread.start()
-        return self
 
     def close(self):
         self._running = False
-        if self.handle is not None:
+        if self._interface is not None and not self._raw_yuyv:
             try:
                 self._write(CMD_STOP)
             except Exception:
@@ -119,13 +141,13 @@ class UseePlusCameraAsync:
                 pass
         if self._thread:
             self._thread.join(timeout=1.0)
-        if self._wd_thread:
-            self._wd_thread.join(timeout=1.5)
         if self.handle is not None:
-            try:
-                self.handle.releaseInterface(INTF)
-            except Exception:
-                pass
+            if self._interface is not None:
+                try:
+                    self.handle.releaseInterface(self._interface)
+                except usb1.USBError:
+                    pass
+                self._interface = None
             self.handle.close()
             self.handle = None
         try:
@@ -145,73 +167,11 @@ class UseePlusCameraAsync:
             return self.handle.bulkWrite(EP_OUT, data, timeout=800)
 
     def _event_loop(self):
-        # NOTE: a transient USBError (bus reset, timeout race, device NAK storm)
-        # must NOT kill this loop. Breaking here orphans every in-flight transfer
-        # and the stream dies permanently with no signal to the caller - the app
-        # keeps painting its last frame and looks alive. Confirmed with a USB
-        # sniffer: after the break the host stops emitting IN tokens entirely
-        # (zero packets on the wire) until the process is restarted.
         while self._running:
             try:
                 self.ctx.handleEventsTimeout(0.1)
             except usb1.USBError:
-                self._usb_errors += 1
-                continue
-
-    def _watchdog(self):
-        """Reopen the device if no frame has arrived for STALL_TIMEOUT seconds."""
-        while self._running:
-            time.sleep(1.0)
-            if not self._running:
                 break
-            idle = time.time() - self._last_frame_ts
-            if idle < STALL_TIMEOUT:
-                continue
-            self.stalls += 1
-            try:
-                self._reopen()
-            except Exception:
-                pass
-            self._last_frame_ts = time.time()   # don't thrash if reopen failed
-
-    def _reopen(self):
-        """Tear the USB session down and bring it back up, in place."""
-        for t in self._transfers:
-            try:
-                t.cancel()
-            except Exception:
-                pass
-        self._transfers = []
-        if self.handle is not None:
-            try:
-                self.handle.releaseInterface(INTF)
-            except Exception:
-                pass
-            try:
-                self.handle.close()
-            except Exception:
-                pass
-            self.handle = None
-        time.sleep(0.2)
-        self.handle = self.ctx.openByVendorIDAndProductID(
-            VID, PID, skip_on_error=False)
-        if self.handle is None:
-            raise RuntimeError("device vanished during reopen")
-        self.handle.claimInterface(INTF)
-        self.handle.setInterfaceAltSetting(INTF, ALT)
-        self._buf.clear()               # stale half-frame must not survive
-        self._write(CMD_MFI)
-        try:
-            self.handle.bulkRead(EP_IN, 64, timeout=300)
-        except usb1.USBError:
-            pass
-        self._write(CMD_OPEN)
-        for _ in range(self.num_transfers):
-            t = self.handle.getTransfer()
-            t.setBulk(EP_IN, READ_SIZE, callback=self._on_transfer,
-                      timeout=self.timeout_ms)
-            t.submit()
-            self._transfers.append(t)
 
     def _on_transfer(self, transfer):
         st = transfer.getStatus()
@@ -229,20 +189,13 @@ class UseePlusCameraAsync:
                     self._buf += data[PKT_HEADER:]
                     self._carve()
             elif st == usb1.TRANSFER_TIMED_OUT:
-                # Just count it. Do NOT poke the device with CMD_PULL.
-                #
-                # The device auto-streams after CMD_OPEN - verified on the wire:
-                # the reference implementation sends ZERO host->device packets
-                # for the entire steady-state session. Worse, sending BB AA 06
-                # while streaming actively KILLS the stream. Measured, with the
-                # pull-vs-no-pull order reversed to rule out ordering effects:
-                #     06 every 0.5s -> 2 frames  |  no pulls -> 86 frames
-                #     06 every 0.5s -> 1 frame   |  no pulls -> 85 frames
-                # The old "nudge on timeout" was therefore a death spiral: a
-                # stall caused timeouts -> timeouts sent CMD_PULL -> the pull
-                # killed the stream -> more timeouts -> more pulls. Recovery is
-                # the watchdog's job (reopen), not a mid-stream poke.
+                # genuinely idle -> gently nudge the device to resume streaming
                 self._empty_timeouts += 1
+                if self._empty_timeouts % 3 == 0:
+                    try:
+                        self._write(CMD_PULL)
+                    except Exception:
+                        pass
         # resubmit unless shutting down / cancelled
         if self._running and st != usb1.TRANSFER_CANCELLED:
             try:
@@ -260,24 +213,13 @@ class UseePlusCameraAsync:
                 break
             if s > 0:
                 del buf[:s]
-            e = buf.find(EOI, 2)
-            # A second SOI before the EOI means frame N lost packets mid-flight
-            # and never terminated. Without this guard find(EOI) returns frame
-            # N+1's terminator, both frames get spliced into one blob, and the
-            # decode fails - so ONE dropped packet costs TWO frames. Drop only
-            # the truncated frame and resync on the next SOI.
-            s2 = buf.find(SOI, 2)
-            if s2 >= 0 and (e < 0 or s2 < e):
-                del buf[:s2]
-                self.torn_frames += 1
-                continue
+            e = buf.find(EOI)
             if e < 0:
                 if len(buf) > MAX_BUF:
                     del buf[:]
                 break
             jpg = bytes(buf[:e + 2])
             del buf[:e + 2]
-            self._last_frame_ts = time.time()   # feed the stall watchdog
             # push newest, drop oldest if full (keep latency low)
             try:
                 self._q.put_nowait(jpg)
@@ -303,6 +245,8 @@ class UseePlusCameraAsync:
     # -- public ----------------------------------------------------------
     def set_resolution(self, res_value, cam=1):
         """res_value: a key of RES (e.g. 0x08 for 1280x720). cam: camera index."""
+        if self._raw_yuyv:
+            raise NotImplementedError("YUYV mode uses a fixed 640×480 stream")
         cmd = bytearray([0xBB, 0xAA, 0x0B, 0x00, 0x02, cam & 0xFF,
                          res_value & 0xFF, 0x00])
         self._write(bytes(cmd))
@@ -311,6 +255,10 @@ class UseePlusCameraAsync:
         """Yield decoded BGR frames. Truncated frames (dropped USB packets during a
         device stall) are skipped so the viewer holds the last good frame instead of
         flashing a partial image."""
+        if self._raw_yuyv:
+            yield from self._raw_frames()
+            return
+
         while self._running or not self._q.empty():
             try:
                 jpg = self._q.get(timeout=1.0)
@@ -325,3 +273,17 @@ class UseePlusCameraAsync:
             img = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
             if img is not None:
                 yield img
+
+    def _raw_frames(self):
+        deadline = time.monotonic() + self.timeout_ms / 1000
+        while self._running:
+            data = self.handle.bulkRead(
+                RAW_EP_IN, RAW_FRAME_BYTES, timeout=self.timeout_ms
+            )
+            if len(data) == RAW_FRAME_BYTES:
+                pixels = np.frombuffer(data, dtype=np.uint8)
+                pixels = pixels.reshape(RAW_HEIGHT, RAW_WIDTH, 2)
+                yield cv2.cvtColor(pixels, cv2.COLOR_YUV2BGR_YUY2)
+                deadline = time.monotonic() + self.timeout_ms / 1000
+            elif time.monotonic() >= deadline:
+                raise RuntimeError("No complete YUYV frame received")
